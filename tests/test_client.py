@@ -418,3 +418,75 @@ def test_context_manager_closes_session(monkeypatch):
     with IndReelForge(api_key="k") as c:
         monkeypatch.setattr(c._session, "close", lambda: closed.append(True))
     assert closed == [True]
+
+
+# ── Credential platforms ──
+
+
+def test_platform_constants():
+    from indreelforge import CREDENTIAL_PLATFORMS, PLATFORMS
+
+    for p in ("discord", "telegram", "slack", "mastodon", "wordpress", "google_business"):
+        assert p in PLATFORMS
+    assert CREDENTIAL_PLATFORMS == {
+        "discord": ("webhook_url",),
+        "telegram": ("bot_token", "chat_id"),
+        "slack": ("webhook_url",),
+        "mastodon": ("instance_url", "access_token"),
+        "wordpress": ("site_url", "username", "app_password"),
+    }
+
+
+def test_connect_with_credentials_kwargs(http, client):
+    http.queue(body={"success": True, "message": "Connected to Telegram as @ch", "platform_username": "@ch"})
+    res = client.connect_with_credentials("my brand", "telegram", bot_token="123:AA", chat_id="@ch")
+    assert res["platform_username"] == "@ch"
+    req, body, _ = http.last
+    assert req.method == "POST"
+    assert req.url == f"{BASE}/api/profiles/my%20brand/connect/telegram/credentials"
+    assert req.headers["Content-Type"] == "application/json"
+    assert json.loads(body) == {"bot_token": "123:AA", "chat_id": "@ch"}
+
+
+def test_connect_with_credentials_dict_and_override(http, client):
+    http.queue(body={"success": True, "platform_username": "admin"})
+    client.connect_with_credentials(
+        "brand",
+        "wordpress",
+        {"site_url": "https://example.com", "username": "admin", "app_password": "old"},
+        app_password="abcd efgh",
+    )
+    assert json.loads(http.last[1]) == {
+        "site_url": "https://example.com", "username": "admin", "app_password": "abcd efgh",
+    }
+
+
+@pytest.mark.parametrize(
+    "status,payload,code,field",
+    [
+        (400, {"error": "Channel or chat is required.", "code": "MISSING_FIELD", "field": "chat_id", "details": {"field": "chat_id"}}, "MISSING_FIELD", "chat_id"),
+        (400, {"error": "Bot token is too long.", "code": "FIELD_TOO_LONG", "field": "bot_token", "details": {"field": "bot_token"}}, "FIELD_TOO_LONG", "bot_token"),
+        (400, {"error": "Telegram rejected the bot token.", "code": "INVALID_CREDENTIALS", "error_code": "INVALID_CREDENTIALS", "details": {"field": "bot_token"}}, "INVALID_CREDENTIALS", "bot_token"),
+        (404, {"error": "Profile not found"}, None, None),
+        (502, {"error": "Could not reach Telegram to check these details. Please try again."}, None, None),
+    ],
+)
+def test_connect_with_credentials_errors(http, client, status, payload, code, field):
+    http.queue(status=status, body=payload)
+    with pytest.raises(IndReelForgeError) as ei:
+        client.connect_with_credentials("brand", "telegram", bot_token="b", chat_id="@c")
+    e = ei.value
+    assert e.status_code == status
+    assert e.code == code
+    assert str(e) == payload["error"]
+    assert (e.body.get("details") or {}).get("field") == field
+
+
+def test_connect_with_credentials_validation(http, client):
+    with pytest.raises(ValueError):
+        client.connect_with_credentials("", "slack", webhook_url="u")
+    with pytest.raises(ValueError):
+        client.connect_with_credentials("brand", "")
+    with pytest.raises(ValueError):
+        client.connect_with_credentials("brand", "slack")
+    assert http.requests == []

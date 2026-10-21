@@ -14,6 +14,21 @@ DEFAULT_BASE_URL = "https://api.indreelforge.com"
 USER_AGENT = f"indreelforge-python/{__version__}"
 MAX_PHOTOS = 10
 
+#: Every platform key known to this SDK version.
+PLATFORMS = (
+    "instagram", "youtube", "tiktok", "facebook", "x", "linkedin", "threads", "pinterest",
+    "reddit", "bluesky", "google_business", "discord", "telegram", "slack", "mastodon", "wordpress",
+)
+
+#: Platforms connected with :meth:`IndReelForge.connect_with_credentials`, and their required fields.
+CREDENTIAL_PLATFORMS: Dict[str, Tuple[str, ...]] = {
+    "discord": ("webhook_url",),
+    "telegram": ("bot_token", "chat_id"),
+    "slack": ("webhook_url",),
+    "mastodon": ("instance_url", "access_token"),
+    "wordpress": ("site_url", "username", "app_password"),
+}
+
 Field = Tuple[str, Tuple[Optional[str], Any]]
 
 
@@ -555,6 +570,51 @@ class IndReelForge:
         """Delete a managed profile."""
         _require(name, "name")
         return self._request("DELETE", f"/api/profiles/{_seg(name)}")
+
+    def connect_with_credentials(
+        self,
+        profile: str,
+        platform: str,
+        credentials: Optional[Mapping[str, str]] = None,
+        **fields: str,
+    ) -> Dict[str, Any]:
+        """
+        Connect a platform that uses credentials instead of OAuth.
+
+        Pass the platform's fields as a dict, as keyword arguments, or both
+        (keyword arguments win)::
+
+            client.connect_with_credentials("my-brand", "telegram", bot_token="123:AA...", chat_id="@mychannel")
+            client.connect_with_credentials("my-brand", "mastodon", {"instance_url": "https://mastodon.social",
+                                                                    "access_token": "..."})
+
+        Fields per platform (all required; see ``CREDENTIAL_PLATFORMS``):
+            discord: webhook_url | telegram: bot_token, chat_id | slack: webhook_url |
+            mastodon: instance_url, access_token | wordpress: site_url, username, app_password
+
+        The server verifies the credentials live before saving them; connecting
+        again replaces them.
+
+        Returns:
+            ``{"success": True, "message": ..., "platform_username": ...}``
+
+        Raises:
+            IndReelForgeError: 400 with ``code`` ``MISSING_FIELD``, ``FIELD_TOO_LONG``
+                or ``INVALID_CREDENTIALS`` (``e.body["details"]["field"]`` names the
+                field), 404 if the profile does not exist, 502 if the platform
+                could not be reached.
+        """
+        _require(profile, "profile")
+        _require(platform, "platform")
+        body: Dict[str, Any] = dict(credentials or {})
+        body.update(fields)
+        if not body:
+            raise ValueError("credentials are required")
+        return self._request(
+            "POST",
+            f"/api/profiles/{_seg(profile)}/connect/{_seg(platform)}/credentials",
+            json=body,
+        )
 
     # ── Scheduling ──
 

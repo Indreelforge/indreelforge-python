@@ -17,7 +17,7 @@ setup(
     version=version,
     author="IndReelForge",
     author_email="support@indreelforge.com",
-    description="Official Python SDK for IndReelForge — Social Media API to post to Instagram, YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky & Google Business Profile",
+    description="Official Python SDK for IndReelForge — Social Media API to post to Instagram, YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky, Google Business Profile, Discord, Telegram, Slack, Mastodon & WordPress",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://indreelforge.com",
@@ -55,5 +55,6 @@ setup(
         "pinterest-api", "reddit-api", "bluesky-api",
         "google-business-profile-api", "social-media-posting", "video-upload",
         "indreelforge", "mcp", "model-context-protocol", "ai-agents",
+        "discord-api", "telegram-api", "slack-api", "mastodon-api", "wordpress-api",
     ],
 )

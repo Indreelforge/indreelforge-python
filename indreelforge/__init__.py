@@ -2,8 +2,9 @@
 IndReelForge — Official Python SDK
 
 Social Media API to publish videos, photos, text and documents to Instagram,
-YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky
-and Google Business Profile with a single API call.
+YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky,
+Google Business Profile, Discord, Telegram, Slack, Mastodon and WordPress
+with a single API call.
 
 Usage:
     from indreelforge import IndReelForge
@@ -19,7 +20,9 @@ Usage:
 
 from ._version import __version__
 from .client import (
+    CREDENTIAL_PLATFORMS,
     DEFAULT_BASE_URL,
+    PLATFORMS,
     IndReelForge,
     IndReelForgeError,
     InReelForge,
@@ -32,5 +35,7 @@ __all__ = [
     "InReelForge",
     "InReelForgeError",
     "DEFAULT_BASE_URL",
+    "PLATFORMS",
+    "CREDENTIAL_PLATFORMS",
     "__version__",
 ]

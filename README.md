@@ -4,7 +4,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/indreelforge.svg)](https://pypi.org/project/indreelforge/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Official Python SDK for the [IndReelForge](https://indreelforge.com) Social Media API. Publish videos, photos, text and documents to **Instagram, YouTube, TikTok, Facebook, X (Twitter), LinkedIn, Threads, Pinterest, Reddit, Bluesky & Google Business Profile** with a single API call.
+Official Python SDK for the [IndReelForge](https://indreelforge.com) Social Media API. Publish videos, photos, text and documents to **Instagram, YouTube, TikTok, Facebook, X (Twitter), LinkedIn, Threads, Pinterest, Reddit, Bluesky, Google Business Profile, Discord, Telegram, Slack, Mastodon & WordPress** with a single API call.
 
 ## Installation
 
@@ -58,7 +58,7 @@ All `upload_*` methods accept:
 | Argument | API field | Description |
 |---|---|---|
 | `user` | `user` | Profile name (required) |
-| `platforms` | `platform[]` | `instagram`, `youtube`, `tiktok`, `facebook`, `x`, `linkedin`, `threads`, `pinterest`, `reddit`, `bluesky`, `google_business` |
+| `platforms` | `platform[]` | `instagram`, `youtube`, `tiktok`, `facebook`, `x`, `linkedin`, `threads`, `pinterest`, `reddit`, `bluesky`, `google_business`, `discord`, `telegram`, `slack`, `mastodon`, `wordpress` (also exported as `PLATFORMS`) |
 | `title` | `title` | Title / caption |
 | `description` | `description` | Long description |
 | `first_comment` | `first_comment` | First comment |
@@ -167,6 +167,73 @@ client.upload_photos(
 
 Use the platform helper methods below to look up page, board and location ids.
 
+**Per-platform text overrides (every platform).** `<platform>_title` and `<platform>_description` replace the shared `title` / `description` for that platform only, e.g. `x_title`, `linkedin_description`, `mastodon_title`, `wordpress_description`.
+
+**Mastodon**
+
+| Field | Values |
+|---|---|
+| `mastodon_visibility` | `public` (default), `unlisted`, `private` or `direct` |
+| `mastodon_spoiler_text` | Content warning shown before the post |
+| `mastodon_sensitive` | `True` to mark media as sensitive. Omit it otherwise: the server treats any non-empty value, including `"false"`, as true |
+| `mastodon_alt_text` | Alt text for attached media (defaults to the title) |
+| `mastodon_language` | ISO 639 language code, e.g. `"en"` |
+
+**WordPress**
+
+| Field | Values |
+|---|---|
+| `wordpress_status` | `publish` (default) or `draft` |
+| `wordpress_categories` | Numeric category IDs: `"3,7"` or `[3, 7]` |
+| `wordpress_tags` | Numeric tag IDs: `"12,15"` or `[12, 15]` |
+
+```python
+client.upload_text(
+    user="my-profile",
+    platforms=["mastodon", "wordpress", "slack"],
+    text="Release notes",
+    description="Full changelog for 1.1 …",
+    platform_options={
+        "mastodon_title": "Release notes are out (short version for Mastodon)",
+        "mastodon_visibility": "unlisted",
+        "mastodon_language": "en",
+        "wordpress_status": "draft",
+        "wordpress_categories": [3, 7],
+        "wordpress_tags": "12,15",
+    },
+)
+```
+
+## Connect platforms with credentials
+
+Discord, Telegram, Slack, Mastodon and WordPress connect with credentials instead of an OAuth login. `connect_with_credentials(profile, platform, credentials=None, **fields)` sends them to the API, which verifies them live with the platform before saving them (encrypted). Connecting again replaces the stored credentials. Pass the fields as a dict, as keyword arguments, or both (keyword arguments win):
+
+| Platform | Fields (all required) |
+|---|---|
+| `discord` | `webhook_url` — channel webhook URL |
+| `telegram` | `bot_token`, `chat_id` — token from @BotFather; public channel `@username` or numeric chat ID |
+| `slack` | `webhook_url` — incoming webhook URL (Slack can only verify it on the first post) |
+| `mastodon` | `instance_url`, `access_token` — e.g. `https://mastodon.social`; token with `write:statuses` and `write:media` |
+| `wordpress` | `site_url`, `username`, `app_password` — self-hosted site, a user who can publish, an application password |
+
+```python
+from indreelforge import IndReelForgeError
+
+res = client.connect_with_credentials("my-profile", "telegram", bot_token="123456789:AA…", chat_id="@mychannel")
+print(res["platform_username"])
+
+try:
+    client.connect_with_credentials(
+        "my-profile", "mastodon", {"instance_url": "https://mastodon.social", "access_token": "bad"}
+    )
+except IndReelForgeError as e:
+    if e.status_code == 400:
+        # e.code: "MISSING_FIELD" | "FIELD_TOO_LONG" | "INVALID_CREDENTIALS"
+        print(e.code, (e.body.get("details") or {}).get("field"), e)
+```
+
+Other failures: `404` (profile not found) and `502` (the platform could not be reached to verify the details). The required fields per platform are also exported as `CREDENTIAL_PLATFORMS`.
+
 ## All methods
 
 | Area | Method | Endpoint |
@@ -186,6 +253,7 @@ Use the platform helper methods below to look up page, board and location ids.
 | Profiles | `get_profiles()` | `GET /api/profiles` |
 | | `create_profile(name)` | `POST /api/profiles` |
 | | `delete_profile(name)` | `DELETE /api/profiles/:name` |
+| | `connect_with_credentials(profile, platform, credentials=None, **fields)` | `POST /api/profiles/:name/connect/:platform/credentials` |
 | Schedule | `get_scheduled_posts()` | `GET /api/schedule` |
 | | `update_scheduled_post(job_id, scheduled_date=None, timezone=None, title=None, caption=None)` | `PATCH /api/schedule/:jobId` |
 | | `cancel_scheduled_post(job_id)` | `DELETE /api/schedule/:jobId` |
@@ -292,6 +360,13 @@ See the [Node.js SDK README](https://github.com/Indreelforge/indreelforge-node#m
 | Reddit | ✓ | ✓ | ✓ | - | ✓ |
 | Bluesky | ✓ | ✓ | ✓ | - | ✓ |
 | Google Business Profile | - | ✓ | ✓ | - | ✓ |
+| Discord | ✓ | ✓ | ✓ | - | ✓ |
+| Telegram | ✓ | ✓ | ✓ | - | ✓ |
+| Slack | - | - | ✓ | - | ✓ |
+| Mastodon | ✓ | ✓ | ✓ | - | ✓ |
+| WordPress | ✓ | ✓ | ✓ | - | ✓ |
+
+Discord, Telegram, Slack, Mastodon and WordPress are connected with [credentials](#connect-platforms-with-credentials); the others connect through an OAuth login in the dashboard (or an app password for Bluesky).
 
 ## Upgrading from 1.0
 
