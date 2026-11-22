@@ -1,4 +1,4 @@
-"""Tests for the IndReelForge client with HTTP mocked at the transport adapter.
+"""Tests for the Post-Upload client with HTTP mocked at the transport adapter.
 
 Requests are fully prepared by ``requests`` (headers, multipart encoding,
 query strings) and captured before anything touches the network.
@@ -16,12 +16,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.structures import CaseInsensitiveDict
 
-import indreelforge
-from indreelforge import (
+import post_upload
+from post_upload import (
     IndReelForge,
     IndReelForgeError,
     InReelForge,
     InReelForgeError,
+    PostUpload,
+    PostUploadError,
     __version__,
 )
 
@@ -76,7 +78,7 @@ def http(monkeypatch):
 
 @pytest.fixture
 def client():
-    return IndReelForge(api_key="test-key", base_url=BASE + "/")
+    return PostUpload(api_key="test-key", base_url=BASE + "/")
 
 
 def multipart(request, body):
@@ -114,8 +116,8 @@ def files(tmp_path):
 
 
 def test_version_single_source():
-    assert __version__ == "1.1.0"
-    assert indreelforge.__version__ == __version__
+    assert __version__ == "1.2.0"
+    assert post_upload.__version__ == __version__
     with open("setup.py", encoding="utf-8") as f:
         setup_src = f.read()
     assert "version=version" in setup_src
@@ -123,15 +125,33 @@ def test_version_single_source():
 
 
 def test_aliases():
-    assert InReelForge is IndReelForge
-    assert InReelForgeError is IndReelForgeError
+    assert InReelForge is IndReelForge is PostUpload
+    assert InReelForgeError is IndReelForgeError is PostUploadError
     err = InReelForgeError("boom", 500)  # 1.0 signature still works
     assert err.status_code == 500 and err.status == 500 and err.code is None and str(err) == "boom"
 
 
-def test_requires_api_key():
+def test_requires_api_key(monkeypatch):
+    monkeypatch.delenv("POST_UPLOAD_API_KEY", raising=False)
+    monkeypatch.delenv("INDREELFORGE_API_KEY", raising=False)
     with pytest.raises(ValueError):
-        IndReelForge(api_key="")
+        PostUpload(api_key="")
+    with pytest.raises(ValueError):
+        PostUpload()
+
+
+def test_api_key_from_env(monkeypatch):
+    monkeypatch.delenv("POST_UPLOAD_API_KEY", raising=False)
+    monkeypatch.setenv("INDREELFORGE_API_KEY", "old-key")
+    assert PostUpload().api_key == "old-key"
+    monkeypatch.setenv("POST_UPLOAD_API_KEY", "new-key")
+    assert PostUpload().api_key == "new-key"
+    assert PostUpload("explicit").api_key == "explicit"
+
+
+def test_default_base_url():
+    assert post_upload.DEFAULT_BASE_URL == "https://api.post-upload.com"
+    assert PostUpload("k").base_url == "https://api.post-upload.com"
 
 
 # ── Headers ──
@@ -144,7 +164,7 @@ def test_sends_auth_and_explicit_user_agent(http, client):
     assert req.method == "GET"
     assert req.url == f"{BASE}/api/me"
     assert req.headers["Authorization"] == "Apikey test-key"
-    assert req.headers["User-Agent"] == f"indreelforge-python/{__version__}"
+    assert req.headers["User-Agent"] == f"post-upload-python/{__version__}"
     assert "python-urllib" not in req.headers["User-Agent"].lower()
     assert "python-requests" not in req.headers["User-Agent"].lower()
     assert kwargs["timeout"] == 120
@@ -424,17 +444,27 @@ def test_context_manager_closes_session(monkeypatch):
 
 
 def test_platform_constants():
-    from indreelforge import CREDENTIAL_PLATFORMS, PLATFORMS
+    from post_upload import CREDENTIAL_OPTIONAL_FIELDS, CREDENTIAL_PLATFORMS, PLATFORMS
 
-    for p in ("discord", "telegram", "slack", "mastodon", "wordpress", "google_business"):
+    for p in ("discord", "telegram", "slack", "mastodon", "wordpress", "google_business",
+              "devto", "hashnode", "lemmy", "nostr", "whop", "listmonk"):
         assert p in PLATFORMS
+    assert len(PLATFORMS) == 22 and len(set(PLATFORMS)) == 22
     assert CREDENTIAL_PLATFORMS == {
         "discord": ("webhook_url",),
         "telegram": ("bot_token", "chat_id"),
         "slack": ("webhook_url",),
         "mastodon": ("instance_url", "access_token"),
         "wordpress": ("site_url", "username", "app_password"),
+        "devto": ("api_key",),
+        "hashnode": ("access_token", "publication_id"),
+        "lemmy": ("instance_url", "username", "password", "community"),
+        "nostr": ("nsec",),
+        "whop": ("api_key",),
+        "listmonk": ("base_url", "api_user", "api_token", "list_ids"),
     }
+    assert set(CREDENTIAL_OPTIONAL_FIELDS) <= set(CREDENTIAL_PLATFORMS)
+    assert CREDENTIAL_OPTIONAL_FIELDS["whop"] == ("experience_id", "channel_id")
 
 
 def test_connect_with_credentials_kwargs(http, client):

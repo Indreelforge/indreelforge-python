@@ -1,45 +1,90 @@
-"""IndReelForge API client."""
+"""Post-Upload API client."""
 
+import io
 import json as _json
+import math
+import mimetypes
 import os
+import shutil
+import tempfile
+import time
 from contextlib import ExitStack
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import (
+    IO, Any, BinaryIO, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union,
+)
 from urllib.parse import quote
 
 import requests
 
 from ._version import __version__
+from .types import (
+    CompletedUploadSession, SkippedPlatform, UploadResponse, UploadSession, UploadSessionStatus,
+)
 
-DEFAULT_BASE_URL = "https://api.indreelforge.com"
-USER_AGENT = f"indreelforge-python/{__version__}"
+DEFAULT_BASE_URL = "https://api.post-upload.com"
+USER_AGENT = f"post-upload-python/{__version__}"
 MAX_PHOTOS = 10
+
+#: Environment variables read (in order) when no ``api_key`` is passed.
+API_KEY_ENV_VARS = ("POST_UPLOAD_API_KEY", "INDREELFORGE_API_KEY")
+
+#: Local videos larger than this (bytes) are sent with the chunked upload
+#: endpoints automatically. Requests reach the API through Cloudflare, which
+#: caps a single request body at 100 MB.
+CHUNKED_THRESHOLD = 95 * 1024 * 1024
+
+#: Largest video the API accepts (via chunked upload or ``video_url``).
+MAX_VIDEO_BYTES = 500 * 1024 * 1024
+
+#: Statuses on which a chunk upload is retried (plus network errors / timeouts).
+RETRYABLE_STATUSES = frozenset({0, 408, 425, 429, 500, 502, 503, 504})
 
 #: Every platform key known to this SDK version.
 PLATFORMS = (
     "instagram", "youtube", "tiktok", "facebook", "x", "linkedin", "threads", "pinterest",
     "reddit", "bluesky", "google_business", "discord", "telegram", "slack", "mastodon", "wordpress",
+    "devto", "hashnode", "lemmy", "nostr", "whop", "listmonk",
 )
 
-#: Platforms connected with :meth:`IndReelForge.connect_with_credentials`, and their required fields.
+#: Platforms connected with :meth:`PostUpload.connect_with_credentials`, and their required fields.
 CREDENTIAL_PLATFORMS: Dict[str, Tuple[str, ...]] = {
     "discord": ("webhook_url",),
     "telegram": ("bot_token", "chat_id"),
     "slack": ("webhook_url",),
     "mastodon": ("instance_url", "access_token"),
     "wordpress": ("site_url", "username", "app_password"),
+    "devto": ("api_key",),
+    "hashnode": ("access_token", "publication_id"),
+    "lemmy": ("instance_url", "username", "password", "community"),
+    "nostr": ("nsec",),
+    "whop": ("api_key",),
+    "listmonk": ("base_url", "api_user", "api_token", "list_ids"),
 }
+
+#: Optional credential fields per platform (see :data:`CREDENTIAL_PLATFORMS`).
+#: Whop needs exactly one of ``experience_id`` (forum) or ``channel_id`` (chat).
+CREDENTIAL_OPTIONAL_FIELDS: Dict[str, Tuple[str, ...]] = {
+    "devto": ("base_url",),
+    "lemmy": ("totp",),
+    "nostr": ("relays", "blossom_server"),
+    "whop": ("experience_id", "channel_id"),
+}
+
+ProgressCallback = Callable[[int, int], None]
+VideoSource = Union[str, "os.PathLike[str]", bytes, bytearray, memoryview, IO[bytes]]
 
 Field = Tuple[str, Tuple[Optional[str], Any]]
 
 
-class IndReelForgeError(Exception):
-    """Error from the IndReelForge API (or a network failure / timeout).
+class PostUploadError(Exception):
+    """Error from the Post-Upload API (or a network failure / timeout).
 
     Attributes:
         status_code: HTTP status code (0 = network error, 408 = client-side timeout).
         code: Machine-readable error code from the API (``error_code`` / ``code``),
             or ``NETWORK_ERROR`` / ``TIMEOUT``; ``None`` when not provided.
         body: Parsed JSON response body (dict) or raw text, if any.
+        headers: Response headers (``None`` for network errors).
     """
 
     def __init__(
@@ -48,12 +93,14 @@ class IndReelForgeError(Exception):
         status_code: int = 0,
         code: Optional[str] = None,
         body: Any = None,
+        headers: Optional[Mapping[str, str]] = None,
     ):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.code = code
         self.body = body
+        self.headers = headers
 
     @property
     def status(self) -> int:
@@ -67,8 +114,10 @@ class IndReelForgeError(Exception):
         )
 
 
-#: Deprecated alias kept for 1.0.x code (``except InReelForgeError`` keeps working).
-InReelForgeError = IndReelForgeError
+#: Deprecated aliases (the SDK was called IndReelForge / InReelForge before
+#: 1.2.0). They are the same class, so ``except IndReelForgeError`` keeps working.
+IndReelForgeError = PostUploadError
+InReelForgeError = PostUploadError
 
 
 def _form_value(value: Any) -> Optional[List[str]]:
@@ -89,6 +138,28 @@ def _form_value(value: Any) -> Optional[List[str]]:
     return [str(value)]
 
 
+def get_skipped_platforms(response: Any) -> List[SkippedPlatform]:
+    """
+    Platforms an upload skipped because the file is too large for them.
+
+    They are stored as ``failed`` with ``FILE_TOO_LARGE_FOR_PLATFORM``, never
+    sent, and use none of the platform's quota; the other platforms publish.
+    Returns ``[]`` when nothing was skipped.
+
+    Example:
+        >>> res = client.upload_video("my-brand", ["youtube", "bluesky"], video_path="big.mp4")
+        >>> for s in get_skipped_platforms(res):
+        ...     print(s["platform"], s.get("message"))
+    """
+    if not isinstance(response, dict):
+        return []
+    data = response.get("data")
+    skipped = data.get("skipped_platforms") if isinstance(data, dict) else None
+    if skipped is None:
+        skipped = response.get("skipped_platforms")
+    return list(skipped) if isinstance(skipped, list) else []
+
+
 def _seg(value: Any) -> str:
     return quote(str(value), safe="")
 
@@ -98,28 +169,36 @@ def _require(value: Any, name: str) -> None:
         raise ValueError(f"{name} is required")
 
 
-class IndReelForge:
+class PostUpload:
     """
-    Official Python client for the IndReelForge Social Media API.
+    Official Python client for the Post-Upload API.
 
-    Publish videos, photos, text and documents to Instagram, YouTube, TikTok,
-    Facebook, X (Twitter), LinkedIn, Threads, Pinterest, Reddit, Bluesky and
-    Google Business Profile.
+    Publish videos, photos, text and documents to 22 platforms: Instagram,
+    YouTube, TikTok, Facebook, X (Twitter), LinkedIn, Threads, Pinterest,
+    Reddit, Bluesky, Google Business Profile, Discord, Telegram, Slack,
+    Mastodon, WordPress, Dev.to, Hashnode, Lemmy, Nostr, Whop and Listmonk.
 
     Args:
-        api_key: Your IndReelForge API key (required).
-        base_url: API base URL (default: https://api.indreelforge.com).
+        api_key: Your Post-Upload API key. When omitted it is read from the
+            ``POST_UPLOAD_API_KEY`` environment variable (or the older
+            ``INDREELFORGE_API_KEY``).
+        base_url: API base URL (default: https://api.post-upload.com).
         timeout: Request timeout in seconds (default: 120).
         session: Optional ``requests.Session`` to use.
         headers: Optional extra headers sent with every request.
+        chunked_threshold: Local videos larger than this many bytes are sent
+            with the chunked upload endpoints (default :data:`CHUNKED_THRESHOLD`,
+            95 MiB).
+        max_retries: How often a failed chunk is retried on 429 / 5xx /
+            network errors (default 5).
 
     The client can be used as a context manager to close its HTTP session::
 
-        with IndReelForge(api_key="...") as client:
+        with PostUpload(api_key="...") as client:
             client.get_me()
 
     Example:
-        >>> client = IndReelForge(api_key="your-api-key")
+        >>> client = PostUpload(api_key="your-api-key")
         >>> result = client.upload_video(
         ...     user="my-profile",
         ...     platforms=["instagram", "tiktok"],
@@ -130,17 +209,27 @@ class IndReelForge:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         base_url: str = DEFAULT_BASE_URL,
         timeout: Union[int, float] = 120,
         session: Optional[requests.Session] = None,
         headers: Optional[Mapping[str, str]] = None,
+        *,
+        chunked_threshold: Optional[int] = None,
+        max_retries: int = 5,
     ):
         if not api_key:
-            raise ValueError("api_key is required")
+            for var in API_KEY_ENV_VARS:
+                api_key = os.environ.get(var)
+                if api_key:
+                    break
+        if not api_key:
+            raise ValueError("api_key is required (or set POST_UPLOAD_API_KEY)")
         self.api_key = api_key
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
+        self.chunked_threshold = chunked_threshold
+        self.max_retries = max(0, int(max_retries))
         self._session = session or requests.Session()
         # Always send an explicit User-Agent: the API sits behind Cloudflare,
         # which blocks generic library agents such as "Python-urllib".
@@ -160,7 +249,7 @@ class IndReelForge:
         """Close the underlying HTTP session."""
         self._session.close()
 
-    def __enter__(self) -> "IndReelForge":
+    def __enter__(self) -> "PostUpload":
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -194,9 +283,9 @@ class IndReelForge:
                 timeout=self.timeout,
             )
         except requests.exceptions.Timeout:
-            raise IndReelForgeError("Request timed out", 408, "TIMEOUT") from None
+            raise PostUploadError("Request timed out", 408, "TIMEOUT") from None
         except requests.exceptions.ConnectionError as e:
-            raise IndReelForgeError(f"Connection failed: {e}", 0, "NETWORK_ERROR") from None
+            raise PostUploadError(f"Connection failed: {e}", 0, "NETWORK_ERROR") from None
 
         text = resp.text or ""
         body: Any = {}
@@ -214,11 +303,12 @@ class IndReelForge:
             if not message:
                 message = text.strip()[:300] if isinstance(body, str) and text.strip() else f"HTTP {resp.status_code}"
             code = (obj.get("error_code") or obj.get("code")) if obj else None
-            raise IndReelForgeError(
+            raise PostUploadError(
                 str(message),
                 resp.status_code,
                 str(code) if code is not None else None,
                 body if text.strip() else None,
+                dict(resp.headers),
             )
 
         return body
@@ -303,13 +393,19 @@ class IndReelForge:
         self,
         user: str,
         platforms: List[str],
-        video_path: Optional[str] = None,
+        video_path: Optional[Union[str, "os.PathLike[str]"]] = None,
         title: Optional[str] = None,
         first_comment: Optional[str] = None,
         schedule: Optional[str] = None,
         timezone: Optional[str] = None,
         *,
         video_url: Optional[str] = None,
+        video_file: Optional[Union[bytes, bytearray, memoryview, IO[bytes]]] = None,
+        staged_file_id: Optional[str] = None,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        chunked: Optional[bool] = None,
+        on_progress: Optional[ProgressCallback] = None,
         description: Optional[str] = None,
         add_to_queue: Optional[bool] = None,
         async_upload: Optional[bool] = None,
@@ -317,19 +413,41 @@ class IndReelForge:
         idempotency_key: Optional[str] = None,
         platform_options: Optional[Mapping[str, Any]] = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> UploadResponse:
         """
         Upload a video to one or more platforms.
+
+        Give the video in exactly one way: ``video_path`` (local file),
+        ``video_file`` (bytes or a binary file object / stream), ``video_url``
+        (public URL the server downloads, up to 500 MB) or ``staged_file_id``
+        (a file already sent with :meth:`upload_large_file`).
+
+        Local files larger than :data:`CHUNKED_THRESHOLD` (95 MiB) are sent with
+        the chunked upload endpoints automatically (up to 500 MB), then posted
+        by ``staged_file_id``. Pass ``chunked=True`` to always do that, or
+        ``chunked=False`` to always send one multipart request.
 
         Args:
             user: Profile name (managed user).
             platforms: Platforms, e.g. ``["instagram", "tiktok", "youtube"]``.
-            video_path: Path to a local video file (or use ``video_url``).
+            video_path: Path to a local video file.
             title: Post title / caption.
             first_comment: First comment text.
             schedule: ISO-8601 datetime to publish later.
             timezone: IANA timezone used with ``schedule``.
             video_url: Public http(s) URL of the video; the server downloads it.
+            video_file: Video bytes or a binary file object (read part by part
+                for a chunked upload; a non-seekable stream is spooled to a
+                temporary file first).
+            staged_file_id: ID returned by :meth:`complete_upload_session` /
+                :meth:`upload_large_file` (usable once).
+            filename: File name sent for ``video_file`` (default: the file
+                object's name, else ``video.mp4``).
+            mime_type: MIME type for a chunked upload (default: from the name).
+            chunked: ``True`` / ``False`` to force or disable the chunked
+                upload; ``None`` (default) decides by size.
+            on_progress: ``on_progress(sent_bytes, total_bytes)``, called after
+                each part of a chunked upload.
             description: Long description.
             add_to_queue: Put the post in the profile's next free queue slot.
             async_upload: ``False`` = wait (up to ~50 s) for the publish result;
@@ -341,10 +459,23 @@ class IndReelForge:
 
         Returns:
             Upload response with ``data.upload_id`` and per-platform statuses.
+            Platforms the file is too large for are skipped (the others still
+            publish) and listed in ``data.skipped_platforms``; see
+            :func:`get_skipped_platforms`.
         """
-        if not video_path and not video_url:
-            raise ValueError("upload_video requires video_path or video_url")
-        if video_path and not os.path.isfile(video_path):
+        sources = [
+            x for x in (video_path, video_file, video_url, staged_file_id)
+            if x is not None and not (isinstance(x, str) and x == "")
+        ]
+        if not sources:
+            raise ValueError(
+                "upload_video requires video_path, video_file, video_url or staged_file_id"
+            )
+        if len(sources) > 1:
+            raise ValueError(
+                "upload_video takes only one of video_path, video_file, video_url or staged_file_id"
+            )
+        if video_path is not None and not os.path.isfile(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
 
         fields = self._build_form_fields(
@@ -352,14 +483,241 @@ class IndReelForge:
             add_to_queue, async_upload, request_id, platform_options, kwargs,
         )
         with ExitStack() as stack:
-            if video_path:
-                fh = stack.enter_context(open(video_path, "rb"))
-                fields.append(("video", (os.path.basename(video_path), fh)))
-            else:
+            if video_path is not None or video_file is not None:
+                source: VideoSource = video_path if video_path is not None else video_file  # type: ignore[assignment]
+                fh, name, size = self._open_source(stack, source, filename)
+                if chunked or (chunked is None and size > self._threshold()):
+                    staged_file_id = self._chunked_upload(fh, name, size, mime_type, on_progress)
+                else:
+                    fields.append(("video", (name, fh)))
+            if staged_file_id:
+                fields.append(("staged_file_id", (None, str(staged_file_id))))
+            elif video_url:
                 fields.append(("video", (None, str(video_url))))
             return self._request(
                 "POST", "/api/upload", files=fields, headers=self._idem(idempotency_key)
             )
+
+    # ── Chunked upload (videos up to 500 MB) ──
+
+    def _threshold(self) -> int:
+        return CHUNKED_THRESHOLD if self.chunked_threshold is None else int(self.chunked_threshold)
+
+    @staticmethod
+    def _open_source(
+        stack: ExitStack, source: VideoSource, filename: Optional[str]
+    ) -> Tuple[BinaryIO, str, int]:
+        """Return a seekable binary file positioned at the start, its name and size."""
+        if isinstance(source, (str, os.PathLike)):
+            path = os.fspath(source)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Video file not found: {path}")
+            fh = stack.enter_context(open(path, "rb"))
+            return fh, filename or os.path.basename(path), os.path.getsize(path)
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
+            return io.BytesIO(data), filename or "video.mp4", len(data)
+        if not hasattr(source, "read"):
+            raise TypeError("video must be a path, bytes or a binary file object")
+        name = filename or os.path.basename(str(getattr(source, "name", "") or "")) or "video.mp4"
+        try:
+            seekable = bool(source.seekable()) if hasattr(source, "seekable") else False
+        except Exception:  # pragma: no cover - exotic streams
+            seekable = False
+        if seekable and source.tell() == 0:
+            size = source.seek(0, os.SEEK_END)
+            source.seek(0)
+            return source, name, size  # type: ignore[return-value]
+        # Non-seekable stream (or one not at offset 0): spool it to a temporary
+        # file (in memory up to the threshold, then on disk) so its size is
+        # known and every part can be re-read for a retry.
+        spool = stack.enter_context(tempfile.SpooledTemporaryFile(max_size=CHUNKED_THRESHOLD))
+        shutil.copyfileobj(source, spool, 1024 * 1024)
+        size = spool.tell()
+        spool.seek(0)
+        return spool, name, size  # type: ignore[return-value]
+
+    def create_upload_session(
+        self, filename: str, size: int, mime_type: Optional[str] = None
+    ) -> UploadSession:
+        """
+        Start a chunked upload (``POST /api/upload/chunked/init``).
+
+        Args:
+            filename: Video file name, e.g. ``"episode.mp4"`` (MP4, MOV, AVI, WebM, MKV).
+            size: Total size in bytes (at most 500 MB).
+            mime_type: e.g. ``"video/mp4"`` (default: guessed from ``filename``).
+
+        Returns:
+            ``upload_session_id``, ``chunk_size``, ``total_chunks`` and ``expires_at``.
+        """
+        _require(filename, "filename")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise ValueError("size must be a positive number of bytes")
+        mime = mime_type or mimetypes.guess_type(filename)[0] or "video/mp4"
+        return self._request(
+            "POST",
+            "/api/upload/chunked/init",
+            json={"filename": filename, "size": size, "mime_type": mime},
+        )
+
+    def upload_part(
+        self,
+        session_id: str,
+        index: int,
+        data: Union[bytes, bytearray, memoryview],
+        *,
+        retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Send one part (``PUT /api/upload/chunked/{id}/{index}``).
+
+        Every part must be exactly the session's ``chunk_size`` bytes except the
+        last. Retried with exponential backoff on 429, 5xx and network errors
+        (honouring ``Retry-After``); re-sending an index replaces it.
+
+        Args:
+            session_id: ``upload_session_id`` from :meth:`create_upload_session`.
+            index: 0-based part number.
+            data: The part's bytes.
+            retries: Override the client's ``max_retries`` for this part.
+        """
+        _require(session_id, "session_id")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise ValueError("index must be a non-negative integer")
+        body = bytes(data)
+        attempts = (self.max_retries if retries is None else max(0, int(retries))) + 1
+        for attempt in range(attempts):
+            try:
+                return self._request(
+                    "PUT",
+                    f"/api/upload/chunked/{_seg(session_id)}/{index}",
+                    data=body,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+            except PostUploadError as e:
+                if e.status_code not in RETRYABLE_STATUSES or attempt == attempts - 1:
+                    raise
+                self._sleep(self._retry_delay(e, attempt))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def complete_upload_session(self, session_id: str) -> CompletedUploadSession:
+        """
+        Assemble and check the file (``POST /api/upload/chunked/{id}/complete``).
+
+        Returns:
+            ``staged_file_id`` (pass it to :meth:`upload_video`; usable once).
+        """
+        _require(session_id, "session_id")
+        return self._request("POST", f"/api/upload/chunked/{_seg(session_id)}/complete")
+
+    def get_upload_session(self, session_id: str) -> UploadSessionStatus:
+        """Parts received so far (``GET /api/upload/chunked/{id}``), to resume an upload."""
+        _require(session_id, "session_id")
+        return self._request("GET", f"/api/upload/chunked/{_seg(session_id)}")
+
+    def abort_upload_session(self, session_id: str) -> Dict[str, Any]:
+        """Cancel a chunked upload and delete its parts (``DELETE /api/upload/chunked/{id}``)."""
+        _require(session_id, "session_id")
+        return self._request("DELETE", f"/api/upload/chunked/{_seg(session_id)}")
+
+    def upload_large_file(
+        self,
+        video: VideoSource,
+        *,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> str:
+        """
+        Send a video with the chunked upload endpoints and return its ``staged_file_id``.
+
+        Runs init, every part (sequentially, with retries) and complete. If
+        anything fails after the session was created, the session is cancelled
+        (best effort) and the error is raised.
+
+        Args:
+            video: Path, bytes or binary file object.
+            filename: File name (default: from the path / file object, else ``video.mp4``).
+            mime_type: MIME type (default: guessed from the name).
+            on_progress: ``on_progress(sent_bytes, total_bytes)`` after each part.
+
+        Example:
+            >>> staged = client.upload_large_file("./episode.mp4")
+            >>> client.upload_video("my-brand", ["youtube"], staged_file_id=staged, title="Episode 1")
+        """
+        with ExitStack() as stack:
+            fh, name, size = self._open_source(stack, video, filename)
+            return self._chunked_upload(fh, name, size, mime_type, on_progress)
+
+    def _chunked_upload(
+        self,
+        fh: BinaryIO,
+        name: str,
+        size: int,
+        mime_type: Optional[str],
+        on_progress: Optional[ProgressCallback],
+    ) -> str:
+        if size <= 0:
+            raise ValueError("The video file is empty")
+        if size > MAX_VIDEO_BYTES:
+            raise ValueError(
+                f"The video is {size} bytes; the API accepts at most {MAX_VIDEO_BYTES} bytes (500 MB)"
+            )
+        session = self.create_upload_session(name, size, mime_type)
+        session_id = session.get("upload_session_id") if isinstance(session, dict) else None
+        if not session_id:
+            raise PostUploadError("Chunked upload init returned no upload_session_id", 0, None, session)
+        try:
+            chunk_size = int(session.get("chunk_size") or 0)
+            if chunk_size <= 0:
+                raise PostUploadError("Chunked upload init returned no chunk_size", 0, None, session)
+            total = int(session.get("total_chunks") or math.ceil(size / chunk_size))
+            sent = 0
+            for index in range(total):
+                offset = index * chunk_size
+                length = min(chunk_size, size - offset)
+                fh.seek(offset)
+                part = fh.read(length)
+                if len(part) != length:
+                    raise IOError(
+                        f"Could not read part {index}: expected {length} bytes, got {len(part)}"
+                    )
+                self.upload_part(session_id, index, part)
+                sent += length
+                if on_progress:
+                    on_progress(sent, size)
+            done = self.complete_upload_session(session_id)
+            staged = done.get("staged_file_id") if isinstance(done, dict) else None
+            if not staged:
+                raise PostUploadError(
+                    "Chunked upload complete returned no staged_file_id", 0, None, done
+                )
+            return str(staged)
+        except BaseException:
+            try:
+                self.abort_upload_session(session_id)
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _retry_delay(error: PostUploadError, attempt: int) -> float:
+        retry_after = None
+        for key, value in (error.headers or {}).items():
+            if key.lower() == "retry-after":
+                retry_after = value
+                break
+        if retry_after is not None:
+            try:
+                return min(max(float(retry_after), 0.0), 60.0)
+            except (TypeError, ValueError):
+                pass
+        return min(1.0 * (2 ** attempt), 30.0)
+
+    @staticmethod
+    def _sleep(seconds: float) -> None:
+        time.sleep(seconds)
 
     def upload_photos(
         self,
@@ -588,9 +946,15 @@ class IndReelForge:
             client.connect_with_credentials("my-brand", "mastodon", {"instance_url": "https://mastodon.social",
                                                                     "access_token": "..."})
 
-        Fields per platform (all required; see ``CREDENTIAL_PLATFORMS``):
+        Fields per platform (``?`` = optional; see ``CREDENTIAL_PLATFORMS`` and
+        ``CREDENTIAL_OPTIONAL_FIELDS``):
             discord: webhook_url | telegram: bot_token, chat_id | slack: webhook_url |
-            mastodon: instance_url, access_token | wordpress: site_url, username, app_password
+            mastodon: instance_url, access_token | wordpress: site_url, username, app_password |
+            devto: api_key, base_url? | hashnode: access_token, publication_id |
+            lemmy: instance_url, username, password, community, totp? |
+            nostr: nsec, relays?, blossom_server? |
+            whop: api_key + one of experience_id (forum) / channel_id (chat) |
+            listmonk: base_url, api_user, api_token, list_ids
 
         The server verifies the credentials live before saving them; connecting
         again replaces them.
@@ -599,7 +963,7 @@ class IndReelForge:
             ``{"success": True, "message": ..., "platform_username": ...}``
 
         Raises:
-            IndReelForgeError: 400 with ``code`` ``MISSING_FIELD``, ``FIELD_TOO_LONG``
+            PostUploadError: 400 with ``code`` ``MISSING_FIELD``, ``FIELD_TOO_LONG``
                 or ``INVALID_CREDENTIALS`` (``e.body["details"]["field"]`` names the
                 field), 404 if the profile does not exist, 502 if the platform
                 could not be reached.
@@ -778,5 +1142,6 @@ class IndReelForge:
         return self._request("GET", "/api/plans")
 
 
-#: Deprecated alias kept for 1.0.x code.
-InReelForge = IndReelForge
+#: Deprecated aliases (the SDK was called IndReelForge / InReelForge before 1.2.0).
+IndReelForge = PostUpload
+InReelForge = PostUpload

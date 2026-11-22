@@ -8,25 +8,27 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 with open(os.path.join(HERE, "README.md"), "r", encoding="utf-8") as f:
     long_description = f.read()
 
-# Single source of truth: indreelforge/_version.py
-with open(os.path.join(HERE, "indreelforge", "_version.py"), "r", encoding="utf-8") as f:
+# Single source of truth: post_upload/_version.py
+with open(os.path.join(HERE, "post_upload", "_version.py"), "r", encoding="utf-8") as f:
     version = re.search(r'^__version__ = "([^"]+)"', f.read(), re.M).group(1)
 
 setup(
-    name="indreelforge",
+    name="post-upload",
     version=version,
-    author="IndReelForge",
-    author_email="support@indreelforge.com",
-    description="Official Python SDK for IndReelForge — Social Media API to post to Instagram, YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky, Google Business Profile, Discord, Telegram, Slack, Mastodon & WordPress",
+    author="Post-Upload",
+    author_email="support@post-upload.com",
+    description="Official Python SDK for Post-Upload — one API to post to 22 platforms: Instagram, YouTube, TikTok, Facebook, X, LinkedIn, Threads, Pinterest, Reddit, Bluesky, Google Business Profile, Discord, Telegram, Slack, Mastodon, WordPress, Dev.to, Hashnode, Lemmy, Nostr, Whop & Listmonk",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://indreelforge.com",
+    url="https://post-upload.com",
     project_urls={
-        "Documentation": "https://indreelforge.com/docs",
+        "Homepage": "https://post-upload.com",
+        "Documentation": "https://docs.post-upload.com",
         "Source": "https://github.com/Indreelforge/indreelforge-python",
         "Bug Tracker": "https://github.com/Indreelforge/indreelforge-python/issues",
     },
-    packages=find_packages(exclude=["tests", "tests.*"]),
+    packages=find_packages(exclude=["tests", "tests.*"]),  # post_upload + the deprecated indreelforge shim
+    package_data={"post_upload": ["py.typed"]},
     python_requires=">=3.8",
     install_requires=[
         "requests>=2.28.0",
@@ -54,7 +56,8 @@ setup(
         "facebook-api", "twitter-api", "linkedin-api", "threads-api",
         "pinterest-api", "reddit-api", "bluesky-api",
         "google-business-profile-api", "social-media-posting", "video-upload",
-        "indreelforge", "mcp", "model-context-protocol", "ai-agents",
+        "post-upload", "indreelforge", "mcp", "model-context-protocol", "ai-agents",
         "discord-api", "telegram-api", "slack-api", "mastodon-api", "wordpress-api",
+        "devto-api", "hashnode-api", "lemmy-api", "nostr", "whop-api", "listmonk",
     ],
 )
